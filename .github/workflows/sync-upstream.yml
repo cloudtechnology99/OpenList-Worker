@@ -1,0 +1,116 @@
+name: Upstream Sync (OpenList-Worker)
+
+on:
+  schedule:
+    # 每天检查一次（UTC 0 点 = 北京时间 08:00）
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 防止定时触发和手动触发同时运行
+concurrency:
+  group: sync-upstream-openlist-worker
+  cancel-in-progress: false
+
+jobs:
+  sync_latest_from_upstream:
+    name: Sync latest commits from OpenListTeam/OpenList-Worker
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Sync upstream changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "GH Action - Upstream Sync"
+          git config user.email "action@github.com"
+
+          # 已存在则更新 URL，避免重复 add 报错
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/OpenListTeam/OpenList-Worker.git
+          else
+            git remote add upstream https://github.com/OpenListTeam/OpenList-Worker.git
+          fi
+
+          # 显式更新远程跟踪引用
+          git fetch upstream main:refs/remotes/upstream/main
+
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/main)
+
+          echo "本地 HEAD: $LOCAL"
+          echo "上游 HEAD: $REMOTE"
+
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "已是最新，无需同步"
+            exit 0
+          fi
+
+          # 上游带 .github/workflows（build-verify.yml、sync_repo.yml），
+          # 一律走 merge 而非 --ff-only，方便合并后把这些文件还原成本仓库的版本。
+          if git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
+            echo "本地无分叉提交，合并上游（无快进，便于过滤 workflow 文件）..."
+          else
+            # 本地有分叉提交（如改过 wrangler 配置、新增文件、保活提交）
+            # 冲突时优先保留本地，其余上游变更照常合入
+            echo "本地存在分叉提交，执行合并（冲突优先保留本地）..."
+          fi
+
+          if ! git merge --no-ff -X ours --no-edit \
+            -m "chore: merge upstream changes [skip ci]" upstream/main; then
+            # 上游改动的东西在本地被「排除/删除」时，git 报的是 modify/delete 冲突，
+            # -X ours 处理不了这种冲突；只涉及 .github/workflows 时按本仓库现状解决
+            conflicts=$(git diff --name-only --diff-filter=U || true)
+            if [ -n "$conflicts" ] && ! echo "$conflicts" | grep -qv '^\.github/workflows/'; then
+              echo "冲突仅涉及 .github/workflows，按本仓库现状解决："
+              echo "$conflicts"
+              echo "$conflicts" | while IFS= read -r f; do
+                [ -n "$f" ] && git rm -q -f -- "$f"
+              done
+              git commit --no-edit --no-verify
+            else
+              echo "::warning::自动合并失败，已放弃本次同步，请手动 Sync fork"
+              git merge --abort 2>/dev/null || true
+              exit 0
+            fi
+          fi
+
+          # 上游的 .github/workflows 不随同步进入本仓库，原因：
+          # 1) GITHUB_TOKEN 没有 workflows 权限，推送 workflow 文件变更会被 GitHub 拒绝
+          # 2) 上游 sync_repo.yml 依赖 GITEE_* 密钥，在 fork 里跑必然报红
+          # 3) 保留本仓库自己的同步 workflow 与 Actions 设置
+          git checkout "$LOCAL" -- .github/workflows 2>/dev/null || true
+          added=$(git diff --cached --name-only --diff-filter=A "$LOCAL" -- .github/workflows || true)
+          if [ -n "$added" ]; then
+            echo "跳过上游新增的 workflow 文件："
+            echo "$added"
+            echo "$added" | while IFS= read -r f; do
+              [ -n "$f" ] && git rm -q -f -- "$f"
+            done
+          fi
+
+          git commit --amend --no-edit --no-verify
+
+          # 上游这次只动了 workflow 文件时，合并结果与本地完全一致，无需推送
+          if git diff --quiet "$LOCAL" HEAD; then
+            echo "上游变更仅涉及 .github/workflows，已全部跳过，无需推送"
+            git reset --hard "$LOCAL"
+            exit 0
+          fi
+
+          echo "合并后最近提交："
+          git log --oneline -5
+
+          if ! git push origin HEAD:main; then
+            echo "::warning::push 失败，等待下次运行"
+            exit 1
+          fi
+          echo "同步完成"
